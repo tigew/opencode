@@ -201,6 +201,35 @@ Use the keybind `variant_cycle` to quickly switch between variants. [Learn more]
 
 ---
 
+## Gemma 4 (local inference)
+
+Gemma 4 speaks a non-standard dialect for tool calling — it emits `<|tool_call>call:name{...}<tool_call|>` tokens as raw text rather than the OpenAI `tool_calls` JSON shape, and thinking content arrives wrapped in `<|channel>thought...<channel|>` segments. When OpenCode detects a Gemma 4 model served through an `@ai-sdk/openai-compatible` endpoint (llama.cpp, Ollama, LM Studio), it auto-enables a compatibility layer that:
+
+- injects tool declarations into the system prompt using Gemma's `<|tool>declaration:...<tool|>` format,
+- parses `<|tool_call>` tokens out of streamed text and surfaces them as structured tool calls,
+- strips `<|channel>thought...<channel|>` from both streamed and final responses so reasoning does not leak into persisted history,
+- applies Gemma 4's recommended sampling: `temperature=1.0`, `top_p=0.95`, `top_k=65`. These values come from Google's [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4) — note that lowering temperature below `1.0` has been reported to measurably *degrade* coding performance on Gemma 4.
+
+Detection is based on the model id matching `/gemma[-_.]?4/i`. To opt out or customise, set `toolParser` explicitly on the provider in `opencode.json`:
+
+```json title="opencode.json"
+{
+  "provider": {
+    "my-llama-cpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8089/v1",
+        "toolParser": [{ "type": "gemma4" }, { "type": "json" }]
+      }
+    }
+  }
+}
+```
+
+Running llama.cpp with `--jinja` is still recommended (it fixes tokenizer quirks upstream), but not required — the compatibility layer works whether or not llama.cpp parses tool calls server-side. See the [Gemma 4 prompt-formatting reference](https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4) for the underlying dialect.
+
+---
+
 ## Loading models
 
 When OpenCode starts up, it checks for models in the following priority order:

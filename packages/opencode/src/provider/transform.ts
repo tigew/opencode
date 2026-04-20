@@ -6,6 +6,7 @@ import type * as Provider from "./provider"
 import type * as ModelsDev from "./models"
 import { iife } from "@/util/iife"
 import { Flag } from "@/flag/flag"
+import { isGemma4 } from "./gemma4"
 
 type Modality = NonNullable<ModelsDev.Model["modalities"]>["input"][number]
 
@@ -354,6 +355,10 @@ export function temperature(model: Provider.Model) {
   if (id.includes("qwen")) return 0.55
   if (id.includes("claude")) return undefined
   if (id.includes("gemini")) return 1.0
+  // Gemma 4's model card specifies temp 1.0 for all use cases; community
+  // testing shows lowering this *degrades* coding performance — see
+  // https://ai.google.dev/gemma/docs/core/model_card_4
+  if (isGemma4(model)) return 1.0
   if (id.includes("glm-4.6")) return 1.0
   if (id.includes("glm-4.7")) return 1.0
   if (id.includes("minimax-m2")) return 1.0
@@ -370,6 +375,7 @@ export function temperature(model: Provider.Model) {
 export function topP(model: Provider.Model) {
   const id = model.id.toLowerCase()
   if (id.includes("qwen")) return 1
+  if (isGemma4(model)) return 0.95
   if (["minimax-m2", "gemini", "kimi-k2.5", "kimi-k2p5", "kimi-k2-5"].some((s) => id.includes(s))) {
     return 0.95
   }
@@ -383,6 +389,7 @@ export function topK(model: Provider.Model) {
     return 20
   }
   if (id.includes("gemini")) return 64
+  if (isGemma4(model)) return 65
   return undefined
 }
 
@@ -415,6 +422,9 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
     id.includes("big-pickle")
   )
     return {}
+  // Gemma 4 thinking is activated by `<|think|>` inside the system prompt,
+  // not by standard `reasoning_effort`. Skip the usual variants.
+  if (isGemma4(model)) return {}
 
   // see: https://docs.x.ai/docs/guides/reasoning#control-how-hard-the-model-thinks
   if (id.includes("grok") && id.includes("grok-3-mini")) {
