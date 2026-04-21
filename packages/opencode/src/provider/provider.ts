@@ -30,6 +30,7 @@ import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
 import { isGemma4 } from "./gemma4"
 import {
+  createSSEStreamingTransformer,
   getOpenAICompatibleToolParsers,
   rewriteOpenAICompatibleJsonResponse,
   rewriteOpenAICompatibleRequestBody,
@@ -53,6 +54,18 @@ async function applyResponseRewrite(
   headers.delete("content-length")
   const contentType = headers.get("content-type") ?? ""
   if (contentType.includes("text/event-stream")) {
+    // Prefer the true-streaming TransformStream so downstream sees incremental
+    // chunks and `wrapSSE`'s chunk-timeout watchdog stays effective. Falls
+    // back to buffered rewriting only when a parser fundamentally requires
+    // the whole stream (e.g. `json`, which inspects concatenated content).
+    const transformer = createSSEStreamingTransformer(parsers)
+    if (transformer && response.body) {
+      return new Response(response.body.pipeThrough(transformer), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      })
+    }
     const text = await response.text()
     return new Response(rewriteOpenAICompatibleStreamResponse(text, parsers), {
       status: response.status,
@@ -1471,6 +1484,21 @@ const layer: Layer.Layer<
             ...model.headers,
           }
 
+        const isOpenAICompatible = model.api.npm.includes("@ai-sdk/openai-compatible")
+        // Gemma 4 over llama.cpp/Ollama/LM Studio emits tool calls as raw
+        // `<|tool_call>…<tool_call|>` tokens in content, not as OpenAI
+        // `tool_calls`. Auto-enable the compat pipeline when we detect Gemma 4
+        // and the user has not configured `toolParser` themselves. This must
+        // run BEFORE the cache key is computed so two models on the same
+        // provider — one Gemma, one not — do not share an SDK instance and
+        // accidentally inherit each other's compat wrapping.
+        if (isOpenAICompatible && isGemma4(model) && !Array.isArray(options["toolParser"])) {
+          options["toolParser"] = [{ type: "gemma4" }]
+        }
+        const toolParsers: OpenAICompatibleToolParser[] = isOpenAICompatible
+          ? getOpenAICompatibleToolParsers(options)
+          : []
+
         const key = Hash.fast(
           JSON.stringify({
             providerID: model.providerID,
@@ -1484,18 +1512,6 @@ const layer: Layer.Layer<
         const customFetch = options["fetch"]
         const chunkTimeout = options["chunkTimeout"]
         delete options["chunkTimeout"]
-
-        const isOpenAICompatible = model.api.npm.includes("@ai-sdk/openai-compatible")
-        // Gemma 4 over llama.cpp/Ollama/LM Studio emits tool calls as raw
-        // `<|tool_call>…<tool_call|>` tokens in content, not as OpenAI
-        // `tool_calls`. Auto-enable the compat pipeline when we detect Gemma 4
-        // and the user has not configured `toolParser` themselves.
-        if (isOpenAICompatible && isGemma4(model) && !Array.isArray(options["toolParser"])) {
-          options["toolParser"] = [{ type: "gemma4" }, { type: "json" }]
-        }
-        const toolParsers: OpenAICompatibleToolParser[] = isOpenAICompatible
-          ? getOpenAICompatibleToolParsers(options)
-          : []
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
           const fetchFn = customFetch ?? fetch

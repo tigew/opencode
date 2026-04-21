@@ -210,7 +210,7 @@ Gemma 4 speaks a non-standard dialect for tool calling — it emits `<|tool_call
 - strips `<|channel>thought...<channel|>` from both streamed and final responses so reasoning does not leak into persisted history,
 - applies Gemma 4's recommended sampling: `temperature=1.0`, `top_p=0.95`, `top_k=65`. These values come from Google's [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4) — note that lowering temperature below `1.0` has been reported to measurably *degrade* coding performance on Gemma 4.
 
-Detection is based on the model id matching `/gemma[-_.]?4/i`. To opt out or customise, set `toolParser` explicitly on the provider in `opencode.json`:
+Detection is based on the model id matching `/gemma[-_.]?4/i`. The default is `[{ "type": "gemma4" }]`, which rewrites SSE responses incrementally so streamed output appears token-by-token. To opt out or customise, set `toolParser` explicitly on the provider in `opencode.json`:
 
 ```json title="opencode.json"
 {
@@ -219,12 +219,14 @@ Detection is based on the model id matching `/gemma[-_.]?4/i`. To opt out or cus
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8089/v1",
-        "toolParser": [{ "type": "gemma4" }, { "type": "json" }]
+        "toolParser": [{ "type": "gemma4" }]
       }
     }
   }
 }
 ```
+
+Adding `{ "type": "json" }` to the array enables a fallback that inspects concatenated content for JSON-shaped tool calls — useful for non-Gemma custom fine-tunes, but it forces the SSE response to buffer until end-of-stream (progressive rendering is disabled and the chunk-timeout watchdog becomes inactive), so leave it off unless you need it.
 
 Running llama.cpp with `--jinja` is still recommended (it fixes tokenizer quirks upstream), but not required — the compatibility layer works whether or not llama.cpp parses tool calls server-side. See the [Gemma 4 prompt-formatting reference](https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4) for the underlying dialect.
 

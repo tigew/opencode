@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  createSSEStreamingTransformer,
   getOpenAICompatibleToolParsers,
   rewriteOpenAICompatibleJsonResponse,
   rewriteOpenAICompatibleRequestBody,
@@ -207,5 +208,102 @@ describe("openai-compatible compat: gemma4 sse response", () => {
     const out = rewriteOpenAICompatibleStreamResponse(input, [{ type: "gemma4" }])
     expect(out).toContain("regular answer")
     expect(out).toContain("[DONE]")
+  })
+})
+
+describe("openai-compatible compat: createSSEStreamingTransformer", () => {
+  const collect = async (transformer: TransformStream<Uint8Array, Uint8Array>, chunks: string[]) => {
+    const enc = new TextEncoder()
+    const dec = new TextDecoder()
+    const writer = transformer.writable.getWriter()
+    const reader = transformer.readable.getReader()
+    const out: string[] = []
+    const reading = (async () => {
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        out.push(dec.decode(value, { stream: true }))
+      }
+      out.push(dec.decode())
+    })()
+    for (const c of chunks) await writer.write(enc.encode(c))
+    await writer.close()
+    await reading
+    return out
+  }
+
+  test("returns null when json parser is configured (forces buffered fallback)", () => {
+    expect(createSSEStreamingTransformer([{ type: "json" }])).toBeNull()
+    expect(createSSEStreamingTransformer([{ type: "gemma4" }, { type: "json" }])).toBeNull()
+  })
+
+  test("returns null when no parsers are configured", () => {
+    expect(createSSEStreamingTransformer([])).toBeNull()
+  })
+
+  test("emits each event incrementally when only gemma4 is configured", async () => {
+    const transformer = createSSEStreamingTransformer([{ type: "gemma4" }])!
+    expect(transformer).not.toBeNull()
+    const events = [
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}\n\n',
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"content":" there"}}]}\n\n',
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n",
+    ]
+    const out = await collect(transformer, events)
+    // Each input event should have produced at least one output chunk —
+    // proves we are not buffering the whole stream.
+    const nonEmpty = out.filter((c) => c.length > 0)
+    expect(nonEmpty.length).toBeGreaterThan(1)
+    const joined = out.join("")
+    expect(joined).toContain("hi")
+    expect(joined).toContain("there")
+    expect(joined).toContain("[DONE]")
+  })
+
+  test("synthesises tool_calls deltas when gemma tokens cross chunk boundaries", async () => {
+    const transformer = createSSEStreamingTransformer([{ type: "gemma4" }])!
+    const events = [
+      // Split a `<|tool_call>` marker across two SSE events to verify the
+      // streaming parser holds back partial markers between events.
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"reading <|tool_"}}]}\n\n',
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"content":"call>call:read{path:<|\\"|>./a<|\\"|>}<tool_call|>"}}]}\n\n',
+      'data: {"id":"1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n",
+    ]
+    const out = (await collect(transformer, events)).join("")
+    expect(out).toContain("reading")
+    expect(out).toContain("\"name\":\"read\"")
+    expect(out).toContain("\"finish_reason\":\"tool_calls\"")
+    // The literal `<|tool_call>` marker must not be forwarded to downstream.
+    expect(out).not.toContain("<|tool_call>")
+  })
+
+  test("does not buffer events: first delta arrives before later input chunks", async () => {
+    const transformer = createSSEStreamingTransformer([{ type: "gemma4" }])!
+    const enc = new TextEncoder()
+    const dec = new TextDecoder()
+    const writer = transformer.writable.getWriter()
+    const reader = transformer.readable.getReader()
+
+    // Content must exceed the parser's 24-byte holdback for any text to flow
+    // through immediately rather than being buffered as a potential marker
+    // prefix. This is the property we are testing: incremental delivery.
+    const longText = "this is a substantially long first chunk of plain assistant text"
+    const writePromise = writer.write(
+      enc.encode(
+        `data: {"id":"1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":${JSON.stringify(longText)}}}]}\n\n`,
+      ),
+    )
+    const firstRead = await reader.read()
+    await writePromise
+    expect(firstRead.done).toBe(false)
+    expect(dec.decode(firstRead.value)).toContain("this is a substantially")
+
+    await writer.close()
+    while (true) {
+      const r = await reader.read()
+      if (r.done) break
+    }
   })
 })

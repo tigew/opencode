@@ -163,6 +163,183 @@ function applyGemma4ToMessage(choice: Record<string, any>): void {
   }
 }
 
+// True-streaming SSE rewriter: returns a TransformStream that processes
+// `data: {…}\n\n` blocks as they arrive. Returns null when the configured
+// parsers fundamentally need the whole stream (the `json` parser inspects
+// concatenated assistant content and decides at end-of-stream); the caller
+// should then fall back to `rewriteOpenAICompatibleStreamResponse` over
+// `await response.text()`.
+export function createSSEStreamingTransformer(
+  parsers: OpenAICompatibleToolParser[],
+): TransformStream<Uint8Array, Uint8Array> | null {
+  if (parsers.length === 0) return null
+  if (parsers.some((p) => p.type === "json")) return null
+
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const useGemma4 = parsers.some((p) => p.type === "gemma4")
+  const gemma4 = useGemma4 ? new Gemma4StreamParser() : null
+
+  let buffer = ""
+  let template: { id?: string; created?: number; model?: string } = {}
+  let toolIndex = 0
+  let synthesisedToolCalls = false
+
+  const emit = (controller: TransformStreamDefaultController<Uint8Array>, event: ParsedSSEEvent) => {
+    // Once we have synthesised any tool calls, rewrite a trailing
+    // `finish_reason: "stop"` to `"tool_calls"` so downstream sees the
+    // correct terminal reason. We can do this on emit because finish_reason
+    // changes always arrive on the final chunk.
+    if (synthesisedToolCalls && event.type === "json") {
+      const choice = event.value?.choices?.[0]
+      if (choice?.finish_reason === "stop") choice.finish_reason = "tool_calls"
+    }
+    controller.enqueue(encoder.encode(serializeSingleEvent(event)))
+  }
+
+  const processBlock = (block: string, controller: TransformStreamDefaultController<Uint8Array>) => {
+    const event = parseSingleSSEEvent(block)
+    if (event.type !== "json") {
+      emit(controller, event)
+      return
+    }
+
+    template = {
+      id: event.value?.id ?? template.id,
+      created: event.value?.created ?? template.created,
+      model: event.value?.model ?? template.model,
+    }
+
+    const transformed = transformLegacyChunkEvent(event)
+    if (transformed.type !== "json") {
+      emit(controller, transformed)
+      return
+    }
+    const choice = transformed.value?.choices?.[0]
+    const delta = choice?.delta
+
+    if (!gemma4 || typeof delta?.content !== "string" || delta.content.length === 0) {
+      emit(controller, transformed)
+      return
+    }
+
+    const { content, calls } = gemma4.push(delta.content)
+
+    if (content) {
+      delta.content = content
+      emit(controller, transformed)
+    } else if (delta.role || delta.tool_calls || choice?.finish_reason) {
+      delta.content = ""
+      emit(controller, transformed)
+    }
+
+    for (const call of calls) {
+      synthesisedToolCalls = true
+      emit(controller, {
+        type: "json",
+        value: {
+          ...template,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: toolIndex++,
+                    id: call.id,
+                    type: "function",
+                    function: { name: call.name, arguments: JSON.stringify(call.args) },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+      })
+    }
+  }
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true })
+      while (true) {
+        const idx = buffer.search(/\n\n+/)
+        if (idx === -1) break
+        const match = buffer.slice(idx).match(/^\n\n+/)
+        const sepLen = match?.[0].length ?? 2
+        const block = buffer.slice(0, idx).trim()
+        buffer = buffer.slice(idx + sepLen)
+        if (block) processBlock(block, controller)
+      }
+    },
+    flush(controller) {
+      buffer += decoder.decode()
+      const trailing = buffer.trim()
+      buffer = ""
+      if (trailing) processBlock(trailing, controller)
+
+      if (gemma4) {
+        const tail = gemma4.flush()
+        if (tail.content) {
+          emit(controller, {
+            type: "json",
+            value: {
+              ...template,
+              choices: [{ index: 0, delta: { content: tail.content }, finish_reason: null }],
+            },
+          })
+        }
+        for (const call of tail.calls) {
+          synthesisedToolCalls = true
+          emit(controller, {
+            type: "json",
+            value: {
+              ...template,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    role: "assistant",
+                    tool_calls: [
+                      {
+                        index: toolIndex++,
+                        id: call.id,
+                        type: "function",
+                        function: { name: call.name, arguments: JSON.stringify(call.args) },
+                      },
+                    ],
+                  },
+                  finish_reason: "tool_calls",
+                },
+              ],
+            },
+          })
+        }
+      }
+    },
+  })
+}
+
+function parseSingleSSEEvent(block: string): ParsedSSEEvent {
+  const data = block
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+  if (data === "[DONE]") return { type: "done" }
+  const parsed = tryParseJson(data)
+  if (!parsed) return { type: "raw", data }
+  return { type: "json", value: parsed }
+}
+
+function serializeSingleEvent(event: ParsedSSEEvent): string {
+  if (event.type === "done") return "data: [DONE]\n\n"
+  if (event.type === "raw") return `data: ${event.data}\n\n`
+  return `data: ${JSON.stringify(event.value)}\n\n`
+}
+
 export function rewriteOpenAICompatibleStreamResponse(text: string, parsers: OpenAICompatibleToolParser[]): string {
   const events = parseSSEEvents(text)
   let transformed = events.map((event) => transformLegacyChunkEvent(event))
@@ -491,26 +668,9 @@ function parseSSEEvents(text: string): ParsedSSEEvent[] {
     .split(/\n\n+/)
     .map((block) => block.trim())
     .filter(Boolean)
-    .map((block): ParsedSSEEvent => {
-      const data = block
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n")
-
-      if (data === "[DONE]") return { type: "done" }
-      const parsed = tryParseJson(data)
-      if (!parsed) return { type: "raw", data }
-      return { type: "json", value: parsed }
-    })
+    .map(parseSingleSSEEvent)
 }
 
 function serializeSSEEvents(events: ParsedSSEEvent[]): string {
-  return events
-    .map((event) => {
-      if (event.type === "done") return "data: [DONE]\n\n"
-      if (event.type === "raw") return `data: ${event.data}\n\n`
-      return `data: ${JSON.stringify(event.value)}\n\n`
-    })
-    .join("")
+  return events.map(serializeSingleEvent).join("")
 }
