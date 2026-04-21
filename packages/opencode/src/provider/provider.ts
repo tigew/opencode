@@ -28,6 +28,15 @@ import { withStatics } from "@/util/schema"
 
 import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
+import { isGemma4 } from "./gemma4"
+import {
+  createSSEStreamingTransformer,
+  getOpenAICompatibleToolParsers,
+  rewriteOpenAICompatibleJsonResponse,
+  rewriteOpenAICompatibleRequestBody,
+  rewriteOpenAICompatibleStreamResponse,
+  type OpenAICompatibleToolParser,
+} from "./openai-compatible-compat"
 
 const log = Log.create({ service: "provider" })
 
@@ -35,6 +44,53 @@ function shouldUseCopilotResponsesApi(modelID: string): boolean {
   const match = /^gpt-(\d+)/.exec(modelID)
   if (!match) return false
   return Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")
+}
+
+async function applyResponseRewrite(
+  response: Response,
+  parsers: OpenAICompatibleToolParser[],
+): Promise<Response> {
+  const headers = new Headers(response.headers)
+  headers.delete("content-length")
+  const contentType = headers.get("content-type") ?? ""
+  if (contentType.includes("text/event-stream")) {
+    // Prefer the true-streaming TransformStream so downstream sees incremental
+    // chunks and `wrapSSE`'s chunk-timeout watchdog stays effective. Falls
+    // back to buffered rewriting only when a parser fundamentally requires
+    // the whole stream (e.g. `json`, which inspects concatenated content).
+    const transformer = createSSEStreamingTransformer(parsers)
+    if (transformer && response.body) {
+      return new Response(response.body.pipeThrough(transformer), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      })
+    }
+    const text = await response.text()
+    return new Response(rewriteOpenAICompatibleStreamResponse(text, parsers), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+  if (contentType.includes("application/json")) {
+    const text = await response.text()
+    try {
+      const rewritten = rewriteOpenAICompatibleJsonResponse(JSON.parse(text), parsers)
+      return new Response(JSON.stringify(rewritten), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      })
+    } catch {
+      return new Response(text, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      })
+    }
+  }
+  return response
 }
 
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
@@ -1428,6 +1484,21 @@ const layer: Layer.Layer<
             ...model.headers,
           }
 
+        const isOpenAICompatible = model.api.npm.includes("@ai-sdk/openai-compatible")
+        // Gemma 4 over llama.cpp/Ollama/LM Studio emits tool calls as raw
+        // `<|tool_call>…<tool_call|>` tokens in content, not as OpenAI
+        // `tool_calls`. Auto-enable the compat pipeline when we detect Gemma 4
+        // and the user has not configured `toolParser` themselves. This must
+        // run BEFORE the cache key is computed so two models on the same
+        // provider — one Gemma, one not — do not share an SDK instance and
+        // accidentally inherit each other's compat wrapping.
+        if (isOpenAICompatible && isGemma4(model) && !Array.isArray(options["toolParser"])) {
+          options["toolParser"] = [{ type: "gemma4" }]
+        }
+        const toolParsers: OpenAICompatibleToolParser[] = isOpenAICompatible
+          ? getOpenAICompatibleToolParsers(options)
+          : []
+
         const key = Hash.fast(
           JSON.stringify({
             providerID: model.providerID,
@@ -1471,14 +1542,22 @@ const layer: Layer.Layer<
             }
           }
 
+          if (toolParsers.length > 0 && opts.body && opts.method === "POST") {
+            try {
+              const body = JSON.parse(opts.body as string)
+              opts.body = JSON.stringify(rewriteOpenAICompatibleRequestBody(body, toolParsers))
+            } catch {}
+          }
+
           const res = await fetchFn(input, {
             ...opts,
             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
             timeout: false,
           })
 
-          if (!chunkAbortCtl) return res
-          return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+          const rewritten = toolParsers.length > 0 ? await applyResponseRewrite(res, toolParsers) : res
+          if (!chunkAbortCtl) return rewritten
+          return wrapSSE(rewritten, chunkTimeout, chunkAbortCtl)
         }
 
         const bundledLoader = BUNDLED_PROVIDERS[model.api.npm]
